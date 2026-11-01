@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Run: out/gpu/cache-storage-test <dir> (a new directory that the test creates and removes).
 // Exercise the production IO worker without a window, guest process or Vulkan device.
+#include <atomic>
 #include <barrier>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <thread>
 #include <vector>
 #include "../gpu/spartanportgpu.h"
@@ -142,9 +144,28 @@ int main(int argc, char** argv) {
     cache.Open();
     assert(cache.IsOpened());
     assert(std::filesystem::is_directory(cache_root / "TEST00000"));
+    // Flush waits while a write is queued or running and returns once the worker is idle.
+    std::promise<void> release;
+    std::atomic<bool> ran{false};
+    {
+        std::scoped_lock lock{m_request};
+        req_queue.emplace([&ran, gate = release.get_future().share()] {
+            gate.wait();
+            ran = true;
+        });
+    }
+    request_cv.notify_one();
+    assert(!cache.Flush(std::chrono::milliseconds(50)));
+    release.set_value();
+    assert(cache.Flush(std::chrono::seconds(5)) && ran);
+    // A saved blob is on disk when Flush returns; a closed cache has nothing to flush.
+    assert(cache.Save(Storage::BlobType::ShaderBinary, "flushed", std::vector<u32>{7}));
+    assert(cache.Flush(std::chrono::seconds(5)));
+    assert(std::filesystem::file_size(cache_root / "TEST00000" / "flushed.spv") == sizeof(u32));
     cache.Close();
+    assert(cache.Flush(std::chrono::seconds(5)));
     SetUserPath(PathType::CacheDir, original_cache);
 
     std::filesystem::remove_all(root); // Only the directory this test creates above.
-    std::puts("Cache storage: concurrent writes, stop drain and load hardening PASS");
+    std::puts("Cache storage: concurrent writes, stop drain, flush and load hardening PASS");
 }
